@@ -110,6 +110,15 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int err_max
 	return APLRes_Success;
 }
 
+public void OnAllPluginsLoaded()
+{
+	g_UsingGameME = LibraryExists("gameme");
+	g_UsingAdminmenu = LibraryExists("adminmenu");
+	g_UsingRankME = LibraryExists("kento_rankme");
+	g_UsingLVLRanks = LibraryExists("lvl_ranks");
+	g_UsingNCRPG = LibraryExists("nc_rpg");
+}
+
 public void OnPluginStart()
 {
 	InitPlayerCountDataPack(0);
