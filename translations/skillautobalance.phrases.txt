@@ -45,6 +45,16 @@
 		"en"			"Balancing uneven teams."
 		"ru"			"Балансировка неравномерных команд."
 	}
+	"Global Scramble Teams"
+	{
+		"en"			"Scrambling teams."
+		"ru"			"Перемешивание команд."
+	}
+	"Client Scramble Team"
+	{
+		"en"			"Swapped to scramble teams."
+		"ru"			"Поменял местами команды."
+	}
 	"Client Skill Balance"
 	{
 		"en"			"Swapped to balance average skill of each team."
