@@ -1,6 +1,5 @@
 #include <sourcemod>
-#include <sdktools_functions>
-#include <sdktools_gamerules>
+#include <sdktools>
 #include <cstrike>
 #include <usermessages>
 #undef REQUIRE_PLUGIN
@@ -39,6 +38,7 @@ enum struct PlayerInfo
 ConVar
 	cvar_RoundRestartDelay,
 	cvar_RoundTime,
+	cvar_GraceTime,
 	cvar_ScoreType,
 	cvar_TeamMenu,
 	cvar_UseDecay,
@@ -60,7 +60,8 @@ ConVar
 ;
 
 int
-	g_iClients[MAXPLAYERS + 1],
+	g_Count = 0,
+	g_iClient[MAXPLAYERS + 1],
 	g_iClientTeam[MAXPLAYERS + 1]
 ;
 
@@ -71,10 +72,12 @@ char
 ;
 
 bool
+	g_AllowSpawn = true,
 	g_ForceBalance,
 	g_Balancing,
-	g_iFrozenClients[MAXPLAYERS + 1],
-	g_iOutlierClients[MAXPLAYERS + 1],
+	g_iClientFrozen[MAXPLAYERS + 1],
+	g_iClientOutlier[MAXPLAYERS + 1],
+	g_iClientForceJoin[MAXPLAYERS + 1],
 	g_UsingGameME,
 	g_UsingAdminmenu,
 	g_UsingRankME,
@@ -90,10 +93,6 @@ float
 	g_iClientScore[MAXPLAYERS + 1],
 	g_iStreak[2],
 	g_LastAverageScore
-;
-
-DataPack
-	g_hPlayerCount
 ;
 
 TopMenu hTopMenu = null;
@@ -120,21 +119,22 @@ public void OnAllPluginsLoaded()
 }
 
 public void OnPluginStart()
-{
-	InitPlayerCountDataPack(0);
-	
+{	
 	InitColorStringMap();
 
 	HookEvent("round_end", Event_RoundEnd);
+	HookEvent("round_start", Event_RoundStart);
+	HookEvent("player_connect_full", Event_PlayerConnectFull);
 
 	AddCommandListener(CommandList_JoinTeam, "jointeam");
 
-	cvar_BlockTeamSwitch = CreateConVar("sab_blockteamswitch", "0", "Prevent clients from switching team. Can join spectate. Can switch if it is impossible for them to rejoin same team due to team-size", _, true, 0.0, true, 1.0);
+	cvar_BlockTeamSwitch = CreateConVar("sab_blockteamswitch", "0", "0 = Don't block. 1 = Block, can join spectate, must rejoin same team. 2 = Block, can't join spectate.", _, true, 0.0, true, 2.0);
 	cvar_ChatChangeTeam = CreateConVar("sab_chatchangeteam", "0", "Enable joining teams by chat commands '!join, !play, !j, !p, !spectate, !spec, !s (no picking teams)", _, true, 0.0, true, 1.0);
 	cvar_DecayAmount = CreateConVar("sab_decayamount", "1.5", "The amount to subtract from a streak if UseDecay is true. In other words, the ratio of a team's round wins to the opposing team's must be greater than this number in order for a team balance to eventually occur.", _, true, 1.0);
 	cvar_DisplayChatMessages = CreateConVar("sab_displaychatmessages", "1", "Allow plugin to display messages in the chat", _, true, 0.0, true, 1.0);
 	cvar_ForceBalance = CreateConVar("sab_forcebalance", "0", "Add 'force balance' to 'server commands' in generic admin menu", _, true, 0.0, true, 1.0);
 	cvar_ForceJoinTeam = CreateConVar("sab_forcejointeam", "0", "Force clients to join a team upon connecting to the server. If both sab_chatchangeteam and sab_teammenu are disabled, this will always be enabled (otherwise, clients cannot join a team).", _, true, 0.0, true, 1.0);
+	cvar_GraceTime = FindConVar("mp_join_grace_time");
 	cvar_KeepPlayersAlive = CreateConVar("sab_keepplayersalive", "1", "Living players are kept alive when their teams are changed", _, true, 0.0, true, 1.0);
 	cvar_MessageColor = CreateConVar("sab_messagecolor", "white", "See sab_messagetype for info");
 	cvar_MessageType = CreateConVar("sab_messagetype", "0", "How this plugin's messages will be colored in chat. 0 = no color, 1 = color only prefix with sab_prefixcolor, 2 = color entire message with sab_messagecolor, 3 = color prefix and message with both sab_prefixcolor and sab_messagecolor", _, true, 0.0, true, 3.0);
@@ -175,10 +175,10 @@ public void OnPluginStart()
 		OnConfigsExecuted();
 		for (int i = 1; i <= MaxClients; ++i)
 		{
-			g_iClients[i] = i;
-			if (IsClientInGame(g_iClients[i]))
+			g_iClient[i] = i;
+			if (IsClientInGame(g_iClient[i]))
 			{
-				g_iClientTeam[i] = GetClientTeam(g_iClients[i]);
+				g_iClientTeam[i] = GetClientTeam(g_iClient[i]);
 			}
 		}	
 	}
@@ -298,18 +298,11 @@ void InitColorStringMap()
 	colors.SetString("grey", "\x08");
 	colors.SetString("grey2", "\x0D");
 }
-void InitPlayerCountDataPack(int updatedPlayers)
-{
-	if (g_hPlayerCount == INVALID_HANDLE)
-	{
-		g_hPlayerCount = new DataPack();
-		WritePackCell(g_hPlayerCount, updatedPlayers);
-	}
-}
 
 /* Public Map-Related Functions */
 public void OnMapStart()
 {
+	g_AllowSpawn = true;
 	g_MapLoaded = true;
 	if (cvar_TeamMenu.BoolValue)
 	{
@@ -323,15 +316,30 @@ public void OnMapStart()
 	g_iStreak[1] = 0.0;
 	for (int i = 1; i <= MaxClients; ++i)
 	{
-		g_iClients[i] = i;
+		g_iClient[i] = i;
 	}
 }
 public void OnMapEnd()
 {
 	g_MapLoaded = false;
 }
+public void Event_RoundStart(Handle event, const char[] name, bool dontBroadcast)
+{
+	bool warmupActive = IsWarmupActive();
+	if (warmupActive)
+	{
+		g_AllowSpawn = true;
+		return;
+	}
+	if (cvar_GraceTime.BoolValue)
+	{
+		g_AllowSpawn = true;
+		CreateTimer(cvar_GraceTime.FloatValue, Timer_GraceTimeOver, _, TIMER_FLAG_NO_MAPCHANGE);
+	}
+}
 public void Event_RoundEnd(Handle event, const char[] name, bool dontBroadcast)
 {
+	g_AllowSpawn = false;
 	int tSize = GetTeamClientCount(TEAM_T);
 	int ctSize = GetTeamClientCount(TEAM_CT);
 	BalanceTeamCount();
@@ -470,39 +478,32 @@ Action Command_SetTeam(int client, int args)
 }
 
 /* Timer Callbacks*/
-Action ForceSpectate(Handle timer, int userId)
+Action Timer_DelayTeamUpdate(Handle timer, int userId)
 {
 	int client = GetClientOfUserId(userId);
-	if (client != 0 && IsClientInGame(client) && !IsFakeClient(client))
+	if (client != 0 && IsClientInGame(client) && g_iClientTeam[client] == TEAM_SPEC)
 	{
-		if (cvar_DisplayChatMessages.BoolValue)
-		{
-			ColorPrintToChat(client, "Team Menu Disabled");
-		}
-		SwapPlayer(client, TEAM_SPEC, "Delay Join");
-		CreateTimer(2.0, PutOnRandomTeam, userId);
+		g_iClientTeam[client] = GetClientTeam(client);
 	}
 	return Plugin_Handled;
 }
-Action UnpacifyPlayer(Handle timer, int userID)
+Action Timer_GraceTimeOver(Handle timer)
+{
+	g_AllowSpawn = false;
+	return Plugin_Handled;
+}
+Action Timer_UnpacifyPlayer(Handle timer, int userID)
 {
 	int client = GetClientOfUserId(userID);
-	g_iFrozenClients[client] = false;
+	g_iClientFrozen[client] = false;
 	if(client != 0 && IsClientInGame(client) && !IsFakeClient(client))
 	{
 		SetEntityRenderColor(client, 255, 255, 255, 255);
 		SetEntProp(client, Prop_Data, "m_takedamage", 2, 1);
 	}
+	return Plugin_Handled;
 }
-Action PutOnRandomTeam(Handle timer, int userId)
-{
-	int client = GetClientOfUserId(userId);
-	if(client != 0 && IsClientInGame(client) && !IsFakeClient(client) && GetClientTeam(client) == TEAM_SPEC)
-	{
-		SwapPlayer(client, GetSmallestTeam(), "Auto Join");
-	}
-}
-Action CheckScore(Handle timer, int userId)
+Action Timer_CheckScore(Handle timer, int userId)
 {
 	int client = GetClientOfUserId(userId);
 	if (client != 0 && IsClientInGame(client))
@@ -524,6 +525,17 @@ Action CheckScore(Handle timer, int userId)
 	}
 	return Plugin_Handled;
 }
+
+/* Internal Map-Related Functions */
+bool IsWarmupActive()
+{
+	return view_as<bool>(GameRules_GetProp("m_bWarmupPeriod"));
+}
+bool AreTeamsEmpty()
+{
+	return !(GetTeamClientCount(TEAM_T) + GetTeamClientCount(TEAM_CT));
+}
+
 
 /* Internal Client-Related Functions */
 int GetClientCountNoBots()
@@ -604,17 +616,17 @@ void PacifyPlayer(int client)
 		ColorPrintToChat(client, "Pacified Client");
 	}
 	CS_UpdateClientModel(client);
-	g_iFrozenClients[client] = true;
+	g_iClientFrozen[client] = true;
 	SetEntityRenderColor(client, 0, 170, 174, 255);
 	SetEntProp(client, Prop_Data, "m_takedamage", 0, 1);
-	CreateTimer(cvar_RoundRestartDelay.FloatValue, UnpacifyPlayer, GetClientUserId(client));
+	CreateTimer(cvar_RoundRestartDelay.FloatValue, Timer_UnpacifyPlayer, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
 }
 void UpdateScores()
 {
 	int client;
-	for (int i = 0; i < sizeof(g_iClients); ++i)
+	for (int i = 0; i < sizeof(g_iClient); ++i)
 	{
-		client = g_iClients[i];
+		client = g_iClient[i];
 		if (client != 0 && IsClientInGame(client))
 		{
 			GetScore(client);
@@ -634,7 +646,7 @@ void GetScore(int client)
 		if (g_UsingGameME)
 		{
 			QueryGameMEStats("playerinfo", client, GameMEStatsCallback, 1);
-			CreateTimer(0.5, CheckScore, GetClientUserId(client));
+			CreateTimer(0.5, Timer_CheckScore, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
 		}
 		else
 		{
@@ -646,7 +658,7 @@ void GetScore(int client)
 		if (g_UsingRankME)
 		{
 			g_iClientScore[client] = float(RankMe_GetPoints(client));
-			CreateTimer(0.5, CheckScore, GetClientUserId(client));
+			CreateTimer(0.5, Timer_CheckScore, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
 		}
 		else
 		{
@@ -655,22 +667,22 @@ void GetScore(int client)
 	}
 	else if (scoreType == TYPE_NCRPG)
 	{
-		if (g_UsingNCRPG)
-		{
+		//if (g_UsingNCRPG)
+		//{
 			g_iClientScore[client] = float(NCRPG_GetLevel(client));
-			CreateTimer(0.5, CheckScore, GetClientUserId(client));
-		}
-		else
-		{
-			LogError("NC RPG not found. Use other score type");
-		}
+			CreateTimer(0.5, Timer_CheckScore, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+		//}
+		//else
+		//{
+		//	LogError("NC RPG not found. Use other score type");
+		//}
 	}
 	else if (scoreType == TYPE_LVLRanks)
 	{
 		if (g_UsingLVLRanks)
 		{
 			g_iClientScore[client] = float(LR_GetClientInfo(client, ST_EXP));
-			CreateTimer(0.5, CheckScore, GetClientUserId(client));
+			CreateTimer(0.5, Timer_CheckScore, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
 		}
 		else
 		{
@@ -679,7 +691,6 @@ void GetScore(int client)
 	}
 	else
 	{
-		++g_Count;
 		float kills, deaths;
 		kills = float(GetClientFrags(client));
 		deaths = float(GetClientDeaths(client));
@@ -696,10 +707,14 @@ void GetScore(int client)
 		{
 			g_iClientScore[client] = kills * kills / deaths;
 		}
-		if (g_Count == GetClientCountNoBots())
+		if (g_Balancing)
 		{
-			BalanceSkill();
-			g_Count = 0;
+			++g_Count;
+			if (g_Count == GetClientCountNoBots())
+			{
+				BalanceSkill();
+				g_Count = 0;
+			}
 		}
 	}
 }
@@ -727,11 +742,7 @@ int GetSmallestTeam()
 {
 	int tSize = GetTeamClientCount(TEAM_T);
 	int ctSize = GetTeamClientCount(TEAM_CT);
-	if(tSize == ctSize)
-	{
-		return GetRandomInt(TEAM_T, TEAM_CT);
-	}
-	return tSize < ctSize ? TEAM_T : TEAM_CT;
+	return tSize == ctSize ? GetRandomInt(TEAM_T, TEAM_CT) : tSize < ctSize ? TEAM_T : TEAM_CT;
 }
 void BalanceTeamCount()
 {
@@ -740,10 +751,10 @@ void BalanceTeamCount()
 	int bigIndex = (smallIndex + 1) % 2;
 	int client;
 	int i = 0;
-	SortIntegers(g_iClients, sizeof(g_iClients), Sort_Random);
-	while(i < sizeof(g_iClients) && (GetTeamClientCount(teams[bigIndex]) - GetTeamClientCount(teams[smallIndex]) > 1))
+	SortIntegers(g_iClient, sizeof(g_iClient), Sort_Random);
+	while(i < sizeof(g_iClient) && (GetTeamClientCount(teams[bigIndex]) - GetTeamClientCount(teams[smallIndex]) > 1))
 	{
-		client = g_iClients[i];
+		client = g_iClient[i];
 		if (client != 0 && IsClientInGame(client) && GetClientTeam(client) == teams[bigIndex])
 		{
 			SwapPlayer(client, teams[smallIndex], "Team Count Balance");
@@ -779,20 +790,20 @@ float GetAverageScore()
 	int client;
 	for (int i = 0; i < count; ++i)
 	{
-		client = g_iClients[i];
+		client = g_iClient[i];
 		sum += g_iClientScore[client];
 	}
 	return sum / count;
 }
 void ScrambleTeams()
 {
-	SortIntegers(g_iClients, sizeof(g_iClients), Sort_Random);
+	SortIntegers(g_iClient, sizeof(g_iClient), Sort_Random);
 	int teams[2] = {2, 3};
 	int nextTeam = GetSmallestTeam() - 2;
 	int client, team;
-	for (int i = 0; i < sizeof(g_iClients); ++i)
+	for (int i = 0; i < sizeof(g_iClient); ++i)
 	{
-		client = g_iClients[i];
+		client = g_iClient[i];
 		if (client == 0 || !IsClientInGame(client) || IsFakeClient(client) || (team = GetClientTeam(client)) == TEAM_SPEC || team == UNASSIGNED)
 		{
 			continue;
@@ -807,7 +818,7 @@ void ScrambleTeams()
 int RemoveOutliers()
 {
 	int outliers = 0;
-	int size = GetClientCountNoBots();
+	int size = GetTeamClientCount(TEAM_T) + GetTeamClientCount(TEAM_CT);
 	int q1Start = 0;
 	int q3End = size - 1;
 	float q1Med, q3Med, IQR;
@@ -820,19 +831,25 @@ int RemoveOutliers()
 		q3Size = q3End - q3Start + 1;
 		if (q1Size % 2 == 0)
 		{
-			q1Med = (g_iClientScore[q1Size / 2 - 1 + q1Start] + g_iClientScore[q1Size / 2 + q1Start]) / 2;
+			int leftClientIndex = g_iClient[q1Size / 2 - 1 + q1Start];
+			int rightClientIndex = g_iClient[q1Size / 2 + q1Start];
+			q1Med = (g_iClientScore[leftClientIndex] + g_iClientScore[rightClientIndex]) / 2;
 		}
 		else
 		{
-			q1Med = g_iClientScore[q1Size / 2 + q1Start];
+			int medianClientIndex = g_iClient[q1Size / 2 + q1Start];
+			q1Med = g_iClientScore[medianClientIndex];
 		}
 		if (q3Size % 2 == 0)
 		{
-			q3Med = (g_iClientScore[q3Size / 2 - 1 + q3Start] + g_iClientScore[q3Size / 2 + q3Start]) / 2;
+			int leftClientIndex = g_iClient[q3Size / 2 - 1 + q3Start];
+			int rightClientIndex = g_iClient[q3Size / 2 + q3Start];
+			q3Med = (g_iClientScore[leftClientIndex] + g_iClientScore[rightClientIndex]) / 2;
 		}
 		else
 		{
-			q3Med = g_iClientScore[q3Size / 2 + q3Start];
+			int medianClientIndex = g_iClient[q3Size / 2 + q3Start];
+			q3Med = g_iClientScore[medianClientIndex];
 		}
 	}
 	else
@@ -843,31 +860,37 @@ int RemoveOutliers()
 		q3Size = q3End - q3Start + 1;
 		if (q1Size % 2 == 0)
 		{
-			q1Med = (g_iClientScore[q1Size / 2 - 1 + q1Start] + g_iClientScore[q1Size / 2 + q1Start]) / 2;
+			int leftClientIndex = g_iClient[q1Size / 2 - 1 + q1Start];
+			int rightClientIndex = g_iClient[q1Size / 2 + q1Start];
+			q1Med = (g_iClientScore[leftClientIndex] + g_iClientScore[rightClientIndex]) / 2;
 		}
 		else
 		{
-			q1Med = g_iClientScore[q1Size / 2 + q1Start];
+			int medianClientIndex = g_iClient[q1Size / 2 + q1Start];
+			q1Med = g_iClientScore[medianClientIndex];
 		}
 		if (q3Size % 2 == 0)
 		{
-			q3Med = (g_iClientScore[q3Size / 2 - 1 + q3Start] + g_iClientScore[q3Size / 2 + q3Start]) / 2;
+			int leftClientIndex = g_iClient[q3Size / 2 - 1 + q3Start];
+			int rightClientIndex = g_iClient[q3Size / 2 + q3Start];
+			q3Med = (g_iClientScore[leftClientIndex] + g_iClientScore[rightClientIndex]) / 2;
 		}
 		else
 		{
-			q3Med = g_iClientScore[q3Size / 2 + q3Start];
+			int medianClientIndex = g_iClient[q3Size / 2 + q3Start];
+			q3Med = g_iClientScore[medianClientIndex];
 		}
 	}
-	IQR = q3Med - q1Med;
-	float upperBound = q3Med + 1.5 * IQR;
-	float lowerBound = q1Med - 1.5 * IQR;
+	IQR = q1Med - q3Med;
+	float lowerBound = q3Med - 1.5 * IQR;
+	float upperBound = q1Med + 1.5 * IQR;
 	int client;
 	for (int i = 0; i < size; ++i)
 	{
-		client = g_iClients[i];
+		client = g_iClient[i];
 		if (g_iClientScore[client] > upperBound || g_iClientScore[client] < lowerBound)
 		{
-			g_iOutlierClients[client] = true;
+			g_iClientOutlier[client] = true;
 			outliers++;
 		}
 	}
@@ -878,12 +901,12 @@ void AddOutliers()
 	int client, team;
 	int teams[2] = {2, 3};
 	int nextTeam = GetSmallestTeam() - 2;
-	for (int i = 0; i < sizeof(g_iClients); ++i)
+	for (int i = 0; i < sizeof(g_iClient); ++i)
 	{
-		client = g_iClients[i];
-		if (g_iOutlierClients[client] && client != 0 && IsClientInGame(client) && !IsFakeClient(client) && (team = GetClientTeam(client)) != TEAM_SPEC && team != UNASSIGNED)
+		client = g_iClient[i];
+		if (g_iClientOutlier[client] && client != 0 && IsClientInGame(client) && !IsFakeClient(client) && (team = GetClientTeam(client)) != TEAM_SPEC && team != UNASSIGNED)
 		{
-			g_iOutlierClients[client] = false;
+			g_iClientOutlier[client] = false;
 			if (g_iClientTeam[client] != teams[nextTeam])
 			{
 				SwapPlayer(client, teams[nextTeam], "Client Skill Balance");
@@ -896,21 +919,21 @@ void SortCloseSums(int outliers)
 {
 	int client, team;
 	int i = 0;
-	int size = GetClientCountNoBots() / 2 - outliers;
+	int size = (GetTeamClientCount(TEAM_T) + GetTeamClientCount(TEAM_CT)) / 2 - outliers;
 	float tSum = 0.0;
 	float ctSum = 0.0;
 	int tCount = 0;
 	int ctCount = 0;
 	while(tCount < size && ctCount < size)
 	{
-		client = g_iClients[i];
-		if (client != 0 && IsClientInGame(client) && !IsFakeClient(client) && (team = GetClientTeam(client)) != TEAM_SPEC && team != UNASSIGNED && !g_iOutlierClients[client])
+		client = g_iClient[i];
+		if (client != 0 && IsClientInGame(client) && !IsFakeClient(client) && (team = GetClientTeam(client)) != TEAM_SPEC && team != UNASSIGNED && !g_iClientOutlier[client])
 		{
 			if (tSum < ctSum)
 			{
 				tSum += g_iClientScore[client];
 				++tCount;
-				if (g_iClientTeam[client] == TEAM_CT)
+				if (team == TEAM_CT)
 				{
 					SwapPlayer(client, TEAM_T, "Client Skill Balance");
 				}
@@ -919,7 +942,7 @@ void SortCloseSums(int outliers)
 			{
 				ctSum += g_iClientScore[client];
 				++ctCount;
-				if (g_iClientTeam[client] == TEAM_T)
+				if (team == TEAM_T)
 				{
 					SwapPlayer(client, TEAM_CT, "Client Skill Balance");
 				}
@@ -927,21 +950,21 @@ void SortCloseSums(int outliers)
 		}
 		++i;
 	}
-	while(i < sizeof(g_iClients))
+	while(i < sizeof(g_iClient))
 	{
-		client = g_iClients[i];
+		client = g_iClient[i];
 		if (client != 0 && IsClientInGame(client) && !IsFakeClient(client) && (team = GetClientTeam(client)) != TEAM_SPEC && team != UNASSIGNED)
 		{
 			if (tCount < size)
 			{
-				if (g_iClientTeam[client] == TEAM_CT)
+				if (team == TEAM_CT)
 				{
 					SwapPlayer(client, TEAM_T, "Client Skill Balance");
 				}
 			}
 			else
 			{
-				if(g_iClientTeam[client] == TEAM_T)
+				if(team == TEAM_T)
 				{
 					SwapPlayer(client, TEAM_CT, "Client Skill Balance");
 				}
@@ -956,30 +979,53 @@ void BalanceSkill()
 	{
 		ColorPrintToChatAll("Global Skill Balance");
 	}
-	SortCustom1D(g_iClients, sizeof(g_iClients), Sort_Scores);
+	SortCustom1D(g_iClient, sizeof(g_iClient), Sort_Scores);
 	int outliers = RemoveOutliers();
 	SortCloseSums(outliers);
 	AddOutliers();
 }
 
 /* Public Client-Related Functions */
-public void OnClientPostAdminCheck(int client)
+public void OnClientDisconnect(int client)
 {
-	g_iClientScore[client] = -1.0;
-	g_iFrozenClients[client] = false;
-	g_iOutlierClients[client] = false;
-	if (client != 0 && IsClientInGame(client) && !IsFakeClient(client))
+	if (!AreTeamsEmpty())
 	{
-		if (cvar_ForceJoinTeam.BoolValue || (!cvar_TeamMenu.BoolValue && !cvar_ChatChangeTeam.BoolValue))
-		{
-			CreateTimer(1.0, ForceSpectate, GetClientUserId(client));
-		}
-		GetScore(client);
+		return;
 	}
+	g_AllowSpawn = true;
+}
+void Event_PlayerConnectFull(Event event, const char[] name, bool dontBroadcast)
+{
+	int userId = event.GetInt("userid");
+	int client = GetClientOfUserId(userId);
+	if (client == 0 || !IsClientInGame(client) || IsFakeClient(client))
+	{
+		return;
+	}
+	g_iClientTeam[client] = TEAM_SPEC;
+	g_iClientScore[client] = -1.0;
+	g_iClientFrozen[client] = false;
+	g_iClientOutlier[client] = false;
+	if (cvar_ForceJoinTeam.BoolValue || (!cvar_ChatChangeTeam.BoolValue && !cvar_TeamMenu.BoolValue && cvar_BlockTeamSwitch.IntValue > 0))
+	{
+		g_iClientForceJoin[client] = true;
+		int team = GetSmallestTeam();
+		ClientCommand(client, "jointeam 0 %i", team);
+		CreateTimer(2.0, Timer_DelayTeamUpdate, userId, TIMER_FLAG_NO_MAPCHANGE);
+		if (!IsPlayerAlive(client) && (g_iClientTeam[client] == TEAM_T || g_iClientTeam[client] == TEAM_CT) && (g_AllowSpawn || AreTeamsEmpty()))
+		{
+			CS_RespawnPlayer(client);
+		}
+	}
+	else
+	{
+		g_iClientForceJoin[client] = false;
+	}
+	GetScore(client);
 }
 public Action OnPlayerRunCmd(int client, int &buttons)
 {
-	if (g_iFrozenClients[client])
+	if (g_iClientFrozen[client])
 	{
 		buttons &= ~IN_ATTACK2;
 		buttons &= ~IN_ATTACK;
@@ -1008,39 +1054,35 @@ int get_param(int index, int argument_count)
 /* Command Listeners */
 Action CommandList_JoinTeam(int client, const char[] command, int argc)
 {
-	if (!cvar_TeamMenu.BoolValue)
-	{
-		ColorPrintToChat(client, "Team Menu Disabled");
-		return Plugin_Stop;
-	}
-	if (!cvar_BlockTeamSwitch.BoolValue)
+	if (cvar_BlockTeamSwitch.IntValue == 0)
 	{
 		return Plugin_Continue;
 	}
-	if(IsFakeClient(client))
+	if (g_iClientForceJoin[client])
 	{
+		g_iClientForceJoin[client] = false;
 		return Plugin_Continue;
 	}
-	if(client != 0 && !IsClientInGame(client))
+	if (cvar_BlockTeamSwitch.IntValue == 2)
 	{
 		return Plugin_Stop;
 	}
 	char arg[5];
 	GetCmdArg(1, arg, sizeof(arg));
-	int newTeam = StringToInt(arg);
-	if (newTeam == UNASSIGNED)
+	int team  = StringToInt(arg);
+	if (team == UNASSIGNED)
 	{
 		return Plugin_Stop;
 	}
-	if (newTeam == TEAM_SPEC)
+	if (team == TEAM_SPEC)
 	{
 		return Plugin_Continue;
 	}
-	if (!CanJoin(client, newTeam, true))
+	if (!CanJoin(client, team, true))
 	{
 		return Plugin_Stop;
 	}
-	g_iClientTeam[client] = newTeam;
+	g_iClientTeam[client] = team;
 	return Plugin_Continue;
 }
 
