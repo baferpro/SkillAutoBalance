@@ -1,7 +1,8 @@
 #include <sourcemod>
 #include <sdktools>
 #include <cstrike>
-#include <usermessages>
+#include <clientprefs>
+#include <autoexecconfig>
 #undef REQUIRE_PLUGIN
 #include <adminmenu>
 #include <gameme>
@@ -25,7 +26,7 @@ public Plugin myinfo =
 	name = "SABREMAKE",
 	author = "Justin (ff)",
 	description = "Balance teams when one side is stacked",
-	version = "3.0.2",
+	version = "3.1.0",
 	url = "https://steamcommunity.com/id/NameNotJustin/"
 }
 
@@ -35,7 +36,34 @@ enum struct PlayerInfo
 	int targetUserId;
 }
 
+bool
+	g_AllowSpawn = true,
+	g_ForceBalance,
+	g_Balancing,
+	g_iClientFrozen[MAXPLAYERS + 1],
+	g_iClientOutlier[MAXPLAYERS + 1],
+	g_iClientForceJoin[MAXPLAYERS + 1],
+	g_UsingAdminmenu,
+	g_UsingGameME,
+	g_UsingRankME,
+	g_UsingLVLRanks,
+	g_UsingNCRPG,
+	g_SetTeamHooked = false,
+	g_ForceBalanceHooked = false,
+	g_LateLoad = false,
+	g_MapLoaded = false
+;
+
+char
+	g_MessageColor[4],
+	g_PrefixColor[4],
+	g_Prefix[20]
+;
+
 ConVar
+	cvar_BalanceAfterNPlayersChange,
+	cvar_BalanceAfterNRounds,
+	cvar_BalanceEveryRound,
 	cvar_RoundRestartDelay,
 	cvar_RoundTime,
 	cvar_GraceTime,
@@ -45,6 +73,7 @@ ConVar
 	cvar_DecayAmount,
 	cvar_MinPlayers,
 	cvar_MinStreak,
+	cvar_Scale,
 	cvar_Scramble,
 	cvar_ForceJoinTeam,
 	cvar_ChatChangeTeam,
@@ -59,41 +88,22 @@ ConVar
 	cvar_KeepPlayersAlive
 ;
 
-int
-	g_Count = 0,
-	g_iClient[MAXPLAYERS + 1],
-	g_iClientTeam[MAXPLAYERS + 1]
-;
-
-char
-	g_MessageColor[4],
-	g_PrefixColor[4],
-	g_Prefix[20]
-;
-
-bool
-	g_AllowSpawn = true,
-	g_ForceBalance,
-	g_Balancing,
-	g_iClientFrozen[MAXPLAYERS + 1],
-	g_iClientOutlier[MAXPLAYERS + 1],
-	g_iClientForceJoin[MAXPLAYERS + 1],
-	g_UsingGameME,
-	g_UsingAdminmenu,
-	g_UsingRankME,
-	g_UsingNCRPG,
-	g_UsingLVLRanks,
-	g_SetTeamHooked = false,
-	g_ForceBalanceHooked = false,
-	g_LateLoad = false,
-	g_MapLoaded = false
-;
-
 float
 	g_iClientScore[MAXPLAYERS + 1],
 	g_iStreak[2],
 	g_LastAverageScore
 ;
+
+int
+	g_PlayerCount = 0,
+	g_PlayerCountChange = 0,
+	g_RoundCount = 0,
+	g_iClient[MAXPLAYERS + 1],
+	g_iClientTeam[MAXPLAYERS + 1],
+	g_iClientForceJoinPreference[MAXPLAYERS + 1]
+;
+
+Handle g_hForceSpawn;
 
 TopMenu hTopMenu = null;
 
@@ -115,7 +125,7 @@ public void OnAllPluginsLoaded()
 	g_UsingAdminmenu = LibraryExists("adminmenu");
 	g_UsingRankME = LibraryExists("kento_rankme");
 	g_UsingLVLRanks = LibraryExists("lvl_ranks");
-	g_UsingNCRPG = LibraryExists("nc_rpg");
+	g_UsingNCRPG = LibraryExists("NCRPG");
 }
 
 public void OnPluginStart()
@@ -128,27 +138,32 @@ public void OnPluginStart()
 
 	AddCommandListener(CommandList_JoinTeam, "jointeam");
 
-	cvar_BlockTeamSwitch = CreateConVar("sab_blockteamswitch", "0", "0 = Don't block. 1 = Block, can join spectate, must rejoin same team. 2 = Block, can't join spectate.", _, true, 0.0, true, 2.0);
-	cvar_ChatChangeTeam = CreateConVar("sab_chatchangeteam", "0", "Enable joining teams by chat commands '!join, !play, !j, !p, !spectate, !spec, !s (no picking teams)", _, true, 0.0, true, 1.0);
-	cvar_DecayAmount = CreateConVar("sab_decayamount", "1.5", "The amount to subtract from a streak if UseDecay is true. In other words, the ratio of a team's round wins to the opposing team's must be greater than this number in order for a team balance to eventually occur.", _, true, 1.0);
-	cvar_DisplayChatMessages = CreateConVar("sab_displaychatmessages", "1", "Allow plugin to display messages in the chat", _, true, 0.0, true, 1.0);
-	cvar_ForceBalance = CreateConVar("sab_forcebalance", "0", "Add 'force balance' to 'server commands' in generic admin menu", _, true, 0.0, true, 1.0);
-	cvar_ForceJoinTeam = CreateConVar("sab_forcejointeam", "0", "Force clients to join a team upon connecting to the server. If both sab_chatchangeteam and sab_teammenu are disabled, this will always be enabled (otherwise, clients cannot join a team).", _, true, 0.0, true, 1.0);
-	cvar_GraceTime = FindConVar("mp_join_grace_time");
-	cvar_KeepPlayersAlive = CreateConVar("sab_keepplayersalive", "1", "Living players are kept alive when their teams are changed", _, true, 0.0, true, 1.0);
-	cvar_MessageColor = CreateConVar("sab_messagecolor", "white", "See sab_messagetype for info");
-	cvar_MessageType = CreateConVar("sab_messagetype", "0", "How this plugin's messages will be colored in chat. 0 = no color, 1 = color only prefix with sab_prefixcolor, 2 = color entire message with sab_messagecolor, 3 = color prefix and message with both sab_prefixcolor and sab_messagecolor", _, true, 0.0, true, 3.0);
-	cvar_MinPlayers = CreateConVar("sab_minplayers", "7", "The amount of players not in spectate must be at least this number for a balance to occur", _, true, 2.0);
-	cvar_MinStreak = CreateConVar("sab_minstreak", "6", "Amount of wins in a row a team needs before autobalance occurs", _, true, 0.0);
-	cvar_Prefix = CreateConVar("sab_prefix", "[SAB]", "The prefix for messages this plugin writes in the server");
-	cvar_PrefixColor = CreateConVar("sab_prefixcolor", "white", "See sab_messagetype for info");
+	AutoExecConfig_SetFile("SkillAutoBalance");
+	cvar_BalanceAfterNRounds = AutoExecConfig_CreateConVar("sab_balanceafternrounds", "0", "0 = Disabled. Otherwise, after map change balance teams when 'N' rounds pass. Then balance based on team win streaks", _, true, 0.0);
+	cvar_BalanceAfterNPlayersChange = AutoExecConfig_CreateConVar("sab_balanceafternplayerschange", "0", "0 = Disabled. Otherwise, balance  teams when 'N' players join/leave the server. Requires sab_balanceafternrounds to be enabled", _, true, 0.0);
+	cvar_BalanceEveryRound = AutoExecConfig_CreateConVar("sab_balanceeveryround", "0", "If enabled, teams will be rebalanced at the end of every round", _, true, 0.0, true, 1.0);
+	cvar_BlockTeamSwitch = AutoExecConfig_CreateConVar("sab_blockteamswitch", "0", "0 = Don't block. 1 = Block, can join spectate, must rejoin same team. 2 = Block, can't join spectate.", _, true, 0.0, true, 2.0);
+	cvar_ChatChangeTeam = AutoExecConfig_CreateConVar("sab_chatchangeteam", "0", "Enable joining teams by chat commands '!join, !play, !j, !p, !spectate, !spec, !s (no picking teams)", _, true, 0.0, true, 1.0);
+	cvar_DecayAmount = AutoExecConfig_CreateConVar("sab_decayamount", "1.5", "The amount to subtract from a streak if UseDecay is true. In other words, the ratio of a team's round wins to the opposing team's must be greater than this number in order for a team balance to eventually occur.", _, true, 1.0);
+	cvar_DisplayChatMessages = AutoExecConfig_CreateConVar("sab_displaychatmessages", "1", "Allow plugin to display messages in the chat", _, true, 0.0, true, 1.0);
+	cvar_ForceBalance = AutoExecConfig_CreateConVar("sab_forcebalance", "0", "Add 'force balance' to 'server commands' in generic admin menu", _, true, 0.0, true, 1.0);
+	cvar_ForceJoinTeam = AutoExecConfig_CreateConVar("sab_forcejointeam", "0", "0 = Disabled, 1 = Optional (!settings), 2 = Forced. Force clients to join a team upon connecting to the server. Always enabled if both sab_chatchangeteam and sab_teammenu are disabled", _, true, 0.0, true, 2.0);	cvar_GraceTime = FindConVar("mp_join_grace_time");
+	cvar_KeepPlayersAlive = AutoExecConfig_CreateConVar("sab_keepplayersalive", "1", "Living players are kept alive when their teams are changed", _, true, 0.0, true, 1.0);
+	cvar_MessageColor = AutoExecConfig_CreateConVar("sab_messagecolor", "white", "See sab_messagetype for info");
+	cvar_MessageType = AutoExecConfig_CreateConVar("sab_messagetype", "0", "How this plugin's messages will be colored in chat. 0 = no color, 1 = color only prefix with sab_prefixcolor, 2 = color entire message with sab_messagecolor, 3 = color prefix and message with both sab_prefixcolor and sab_messagecolor", _, true, 0.0, true, 3.0);
+	cvar_MinPlayers = AutoExecConfig_CreateConVar("sab_minplayers", "7", "The amount of players not in spectate must be at least this number for a balance to occur", _, true, 2.0);
+	cvar_MinStreak = AutoExecConfig_CreateConVar("sab_minstreak", "6", "Amount of wins in a row a team needs before autobalance occurs", _, true, 0.0);
+	cvar_Prefix = AutoExecConfig_CreateConVar("sab_prefix", "[SAB]", "The prefix for messages this plugin writes in the server");
+	cvar_PrefixColor = AutoExecConfig_CreateConVar("sab_prefixcolor", "white", "See sab_messagetype for info");
 	cvar_RoundRestartDelay = FindConVar("mp_round_restart_delay");
 	cvar_RoundTime = FindConVar("mp_roundtime");
-	cvar_ScoreType = CreateConVar("sab_scoretype", "0", "Formula used to determine player 'skill'. 0 = K/D, 1 = 2*K/D, 2 = K^2/D, 3 = gameME rank, 4 = RankME, 5 = LVL Ranks, 6 = NC RPG", _, true, 0.0, true, 6.0);
-	cvar_Scramble = CreateConVar("sab_scramble", "0", "Randomize teams instead of using a skill formula", _, true, 0.0, true, 1.0);
-	cvar_SetTeam = CreateConVar("sab_setteam", "0", "Add 'set player team' to 'player commands' in generic admin menu", _, true, 0.0, true, 1.0);
-	cvar_TeamMenu = CreateConVar("sab_teammenu", "1", "Whether to enable or disable the join team menu.", _, true, 0.0, true, 1.0);
-	cvar_UseDecay = CreateConVar("sab_usedecay", "1", "If 1, subtract sab_decayamount from a team's streak when they lose instead of setting their streak to 0", _, true, 0.0, true, 1.0);
+	cvar_Scale = AutoExecConfig_CreateConVar("sab_scale", "1.5", "Value to multiply IQR by. If your sab_scoretype uses points, then here is advice. If your points have low spread from the points people start with when they join your server for the first time, keep this number. If your points have high spread from the points people start with when they join your server for the first time, change this to a lower number, like 0.5", _, true, 0.1);
+	cvar_ScoreType = AutoExecConfig_CreateConVar("sab_scoretype", "0", "Formula used to determine player 'skill'. 0 = K/D, 1 = K/D + K/10 - D/20, 2 = K^2/D, 3 = gameME rank, 4 = RankME, 5 = LVL Ranks, 6 = NCRPG", _, true, 0.0, true, 6.0);	cvar_Scramble = AutoExecConfig_CreateConVar("sab_scramble", "0", "Randomize teams instead of using a skill formula", _, true, 0.0, true, 1.0);
+	cvar_SetTeam = AutoExecConfig_CreateConVar("sab_setteam", "0", "Add 'set player team' to 'player commands' in generic admin menu", _, true, 0.0, true, 1.0);
+	cvar_TeamMenu = AutoExecConfig_CreateConVar("sab_teammenu", "1", "Whether to enable or disable the join team menu.", _, true, 0.0, true, 1.0);
+	cvar_UseDecay = AutoExecConfig_CreateConVar("sab_usedecay", "1", "If 1, subtract sab_decayamount from a team's streak when they lose instead of setting their streak to 0", _, true, 0.0, true, 1.0);
+	AutoExecConfig_ExecuteFile();
+	AutoExecConfig_CleanFile();
 
 	cvar_ForceBalance.AddChangeHook(UpdateForceBalance);
 	cvar_MessageColor.AddChangeHook(UpdateMessageColor);
@@ -169,6 +184,14 @@ public void OnPluginStart()
 	AutoExecConfig(true, "SkillAutoBalance");
 
 	LoadTranslations("skillautobalance.phrases");
+	LoadTranslations("common.phrases");
+	
+	char cookieMenuTitle[100];
+	Format(cookieMenuTitle, sizeof(cookieMenuTitle), "%t", "Auto-Join Preference");
+
+	g_hForceSpawn = RegClientCookie("sab_forcespawn", "Auto-Join On Connect", CookieAccess_Private);
+
+	SetCookieMenuItem(Cookie_ForceSpawnPreference, 1, cookieMenuTitle);
 
 	if (g_LateLoad)
 	{
@@ -251,7 +274,7 @@ public void OnLibraryAdded(const char[] name)
 	{
 		g_UsingLVLRanks = true;
 	}
-	if (StrEqual(name, "nc_rpg"))
+	if (StrEqual(name, "NCRPG"))
 	{
 		g_UsingNCRPG = true;
 	}
@@ -274,7 +297,7 @@ public void OnLibraryRemoved(const char[] name)
 	{
 		g_UsingLVLRanks = false;
 	}
-	if (StrEqual(name, "nc_rpg"))
+	if (StrEqual(name, "NCRPG"))
 	{
 		g_UsingNCRPG = false;
 	}
@@ -304,6 +327,9 @@ public void OnMapStart()
 {
 	g_AllowSpawn = true;
 	g_MapLoaded = true;
+	g_PlayerCount = 0;
+	g_PlayerCountChange = 0;
+	g_RoundCount = 0;
 	if (cvar_TeamMenu.BoolValue)
 	{
 		GameRules_SetProp("m_bIsQueuedMatchmaking", 0);
@@ -323,7 +349,9 @@ public void OnMapEnd()
 {
 	g_MapLoaded = false;
 }
-public void Event_RoundStart(Handle event, const char[] name, bool dontBroadcast)
+
+/* Events */
+void Event_RoundStart(Handle event, const char[] name, bool dontBroadcast)
 {
 	bool warmupActive = IsWarmupActive();
 	if (warmupActive)
@@ -337,9 +365,10 @@ public void Event_RoundStart(Handle event, const char[] name, bool dontBroadcast
 		CreateTimer(cvar_GraceTime.FloatValue, Timer_GraceTimeOver, _, TIMER_FLAG_NO_MAPCHANGE);
 	}
 }
-public void Event_RoundEnd(Handle event, const char[] name, bool dontBroadcast)
+void Event_RoundEnd(Handle event, const char[] name, bool dontBroadcast)
 {
 	g_AllowSpawn = false;
+	++g_RoundCount;
 	int tSize = GetTeamClientCount(TEAM_T);
 	int ctSize = GetTeamClientCount(TEAM_CT);
 	BalanceTeamCount();
@@ -364,10 +393,44 @@ public void Event_RoundEnd(Handle event, const char[] name, bool dontBroadcast)
 				UpdateScores();
 				g_iStreak[0] = 0.0;
 				g_iStreak[1] = 0.0;
+				g_PlayerCountChange = 0;
 			}
 		}
 	}
 	g_ForceBalance = false;
+}
+void Event_PlayerConnectFull(Event event, const char[] name, bool dontBroadcast)
+{
+	int userId = event.GetInt("userid");
+	int client = GetClientOfUserId(userId);
+	if (client == 0 || !IsClientInGame(client) || IsFakeClient(client))
+	{
+		return;
+	}
+	g_iClientTeam[client] = TEAM_SPEC;
+	g_iClientScore[client] = -1.0;
+	g_iClientFrozen[client] = false;
+	g_iClientOutlier[client] = false;
+	++g_PlayerCountChange;
+	if (!cvar_TeamMenu.BoolValue && cvar_DisplayChatMessages.BoolValue)
+	{
+		ColorPrintToChat(client, "Team Menu Disabled");
+	}
+	if ((cvar_ForceJoinTeam.IntValue == 1 && g_iClientForceJoinPreference[client] == 1) || cvar_ForceJoinTeam.IntValue == 2 || (!cvar_ChatChangeTeam.BoolValue && !cvar_TeamMenu.BoolValue && cvar_BlockTeamSwitch.IntValue > 0))
+	{
+		g_iClientForceJoin[client] = true;
+		int team = GetSmallestTeam();
+		ClientCommand(client, "jointeam 0 %i", team);
+		if (!IsPlayerAlive(client) && (g_iClientTeam[client] == TEAM_T || g_iClientTeam[client] == TEAM_CT) && (g_AllowSpawn || AreTeamsEmpty()))
+		{
+			CS_RespawnPlayer(client);
+		}
+	}
+	else
+	{
+		g_iClientForceJoin[client] = false;
+	}
+	GetScore(client);
 }
 
 /* Console Commands */
@@ -478,14 +541,13 @@ Action Command_SetTeam(int client, int args)
 }
 
 /* Timer Callbacks*/
-Action Timer_DelayTeamUpdate(Handle timer, int userId)
+void DelayTeamUpdate(int userId)
 {
 	int client = GetClientOfUserId(userId);
 	if (client != 0 && IsClientInGame(client) && g_iClientTeam[client] == TEAM_SPEC)
 	{
 		g_iClientTeam[client] = GetClientTeam(client);
 	}
-	return Plugin_Handled;
 }
 Action Timer_GraceTimeOver(Handle timer)
 {
@@ -514,14 +576,34 @@ Action Timer_CheckScore(Handle timer, int userId)
 		}
 		if (g_Balancing)
 		{
-			++g_Count;
-			if (g_Count == GetClientCountNoBots())
+			++g_PlayerCount;
+			if (g_PlayerCount == GetClientCountNoBots())
 			{
 				g_Balancing = false;
 				BalanceSkill();
-				g_Count = 0;
+				g_PlayerCount = 0;
 			}
 		}
+	}
+	return Plugin_Handled;
+}
+Action Timer_GetSkillLvl(Handle timer, int userId)
+{
+	int client = GetClientOfUserId(userId);
+	if (client != 0 && IsClientInGame(client))
+	{
+		g_iClientScore[client] = 0.0;
+		for (int i = 0; i < NCRPG_GetSkillCount(); ++i)
+		{
+			if(NCRPG_IsValidSkillID(i))
+			{
+				g_iClientScore[client] += float(NCRPG_GetSkillLevel(client, i));
+				char Name[64];
+				NCRPG_GetSkillName(i, Name, sizeof(Name));
+				PrintToConsoleAll("%N (%s) = %i",client, Name, NCRPG_GetSkillLevel(client, i));
+			}
+		}
+		PrintToConsoleAll("Total = %0.1f", g_iClientScore[client]);
 	}
 	return Plugin_Handled;
 }
@@ -665,18 +747,6 @@ void GetScore(int client)
 			LogError("kento_rankme not found. Use other score type");
 		}
 	}
-	else if (scoreType == TYPE_NCRPG)
-	{
-		//if (g_UsingNCRPG)
-		//{
-			g_iClientScore[client] = float(NCRPG_GetLevel(client));
-			CreateTimer(0.5, Timer_CheckScore, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
-		//}
-		//else
-		//{
-		//	LogError("NC RPG not found. Use other score type");
-		//}
-	}
 	else if (scoreType == TYPE_LVLRanks)
 	{
 		if (g_UsingLVLRanks)
@@ -687,6 +757,19 @@ void GetScore(int client)
 		else
 		{
 			LogError("LVL Ranks not found. Use other score type");
+		}
+	}
+	else if (scoreType == TYPE_NCRPG)
+	{
+		if (g_UsingNCRPG)
+		{
+			//g_iClientScore[client] = float(NCRPG_GetLevel(client));
+			CreateTimer(0.4, Timer_GetSkillLvl, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+			CreateTimer(0.5, Timer_CheckScore, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+		}
+		else
+		{
+			LogError("NC RPG not found. Use other score type");
 		}
 	}
 	else
@@ -709,11 +792,11 @@ void GetScore(int client)
 		}
 		if (g_Balancing)
 		{
-			++g_Count;
-			if (g_Count == GetClientCountNoBots())
+			++g_PlayerCount;
+			if (g_PlayerCount == GetClientCountNoBots())
 			{
 				BalanceSkill();
-				g_Count = 0;
+				g_PlayerCount = 0;
 			}
 		}
 	}
@@ -767,9 +850,30 @@ bool BalanceSkillNeeded()
 	int time;
 	GetMapTimeLeft(time);
 	int minStreak = cvar_MinStreak.IntValue;
-	if (time > (cvar_RoundTime.FloatValue * 60 + cvar_RoundRestartDelay.FloatValue + 1) && (g_iStreak[0] >= minStreak || g_iStreak[1] >= minStreak))
+	if (time > (cvar_RoundTime.FloatValue * 60 + cvar_RoundRestartDelay.FloatValue + 1))
 	{
-		return true;
+		if (cvar_BalanceEveryRound.BoolValue)
+		{
+			return true;
+		}
+		else if (g_iStreak[0] >= minStreak || g_iStreak[1] >= minStreak)
+		{
+			return true;
+		}
+		else if(cvar_BalanceAfterNRounds.BoolValue)
+		{
+			if (g_RoundCount == cvar_BalanceAfterNRounds.IntValue)
+			{
+				return true;
+			}
+			else if (cvar_BalanceAfterNPlayersChange.BoolValue && g_RoundCount >= cvar_BalanceAfterNRounds.IntValue)
+			{
+				if (g_PlayerCountChange >= cvar_BalanceAfterNPlayersChange.IntValue)
+				{
+					return true;
+				}
+			}
+		}
 	}
 	return false;
 }
@@ -882,8 +986,8 @@ int RemoveOutliers()
 		}
 	}
 	IQR = q1Med - q3Med;
-	float lowerBound = q3Med - 1.5 * IQR;
-	float upperBound = q1Med + 1.5 * IQR;
+	float lowerBound = q3Med - cvar_Scale.IntValue * IQR;
+	float upperBound = q1Med + cvar_Scale.IntValue * IQR;
 	int client;
 	for (int i = 0; i < size; ++i)
 	{
@@ -919,12 +1023,15 @@ void SortCloseSums(int outliers)
 {
 	int client, team;
 	int i = 0;
-	int size = (GetTeamClientCount(TEAM_T) + GetTeamClientCount(TEAM_CT)) / 2 - outliers;
+	int tSize = GetTeamClientCount(TEAM_T);
+	int ctSize = GetTeamClientCount(TEAM_CT);
+	int totalSize = tSize + ctSize - outliers;
+	int teamSize = totalSize / 2;
 	float tSum = 0.0;
 	float ctSum = 0.0;
 	int tCount = 0;
 	int ctCount = 0;
-	while(tCount < size && ctCount < size)
+	while((totalSize % 2 == 0 && tCount < teamSize && ctCount < teamSize) || (totalSize % 2 == 1 && tCount <= teamSize && ctCount <= teamSize))
 	{
 		client = g_iClient[i];
 		if (client != 0 && IsClientInGame(client) && !IsFakeClient(client) && (team = GetClientTeam(client)) != TEAM_SPEC && team != UNASSIGNED && !g_iClientOutlier[client])
@@ -933,7 +1040,7 @@ void SortCloseSums(int outliers)
 			{
 				tSum += g_iClientScore[client];
 				++tCount;
-				if (team == TEAM_CT)
+				if (g_iClientTeam[client] == TEAM_CT)
 				{
 					SwapPlayer(client, TEAM_T, "Client Skill Balance");
 				}
@@ -942,7 +1049,7 @@ void SortCloseSums(int outliers)
 			{
 				ctSum += g_iClientScore[client];
 				++ctCount;
-				if (team == TEAM_T)
+				if (g_iClientTeam[client] == TEAM_T)
 				{
 					SwapPlayer(client, TEAM_CT, "Client Skill Balance");
 				}
@@ -953,18 +1060,18 @@ void SortCloseSums(int outliers)
 	while(i < sizeof(g_iClient))
 	{
 		client = g_iClient[i];
-		if (client != 0 && IsClientInGame(client) && !IsFakeClient(client) && (team = GetClientTeam(client)) != TEAM_SPEC && team != UNASSIGNED)
+		if (client != 0 && IsClientInGame(client) && !IsFakeClient(client) && (team = GetClientTeam(client)) != TEAM_SPEC && team != UNASSIGNED && !g_iClientOutlier[client])
 		{
-			if (tCount < size)
+			if (tCount < teamSize)
 			{
-				if (team == TEAM_CT)
+				if (g_iClientTeam[client] == TEAM_CT)
 				{
 					SwapPlayer(client, TEAM_T, "Client Skill Balance");
 				}
 			}
 			else
 			{
-				if(team == TEAM_T)
+				if(g_iClientTeam[client] == TEAM_T)
 				{
 					SwapPlayer(client, TEAM_CT, "Client Skill Balance");
 				}
@@ -986,6 +1093,15 @@ void BalanceSkill()
 }
 
 /* Public Client-Related Functions */
+public void OnClientCookiesCached(int client)
+{
+	char buffer[24];
+	GetClientCookie(client, g_hForceSpawn, buffer, sizeof(buffer));
+	if (strlen(buffer) > 0)
+	{
+		g_iClientForceJoinPreference[client] = StringToInt(buffer);
+	}
+}
 public void OnClientDisconnect(int client)
 {
 	if (!AreTeamsEmpty())
@@ -993,35 +1109,7 @@ public void OnClientDisconnect(int client)
 		return;
 	}
 	g_AllowSpawn = true;
-}
-void Event_PlayerConnectFull(Event event, const char[] name, bool dontBroadcast)
-{
-	int userId = event.GetInt("userid");
-	int client = GetClientOfUserId(userId);
-	if (client == 0 || !IsClientInGame(client) || IsFakeClient(client))
-	{
-		return;
-	}
-	g_iClientTeam[client] = TEAM_SPEC;
-	g_iClientScore[client] = -1.0;
-	g_iClientFrozen[client] = false;
-	g_iClientOutlier[client] = false;
-	if (cvar_ForceJoinTeam.BoolValue || (!cvar_ChatChangeTeam.BoolValue && !cvar_TeamMenu.BoolValue && cvar_BlockTeamSwitch.IntValue > 0))
-	{
-		g_iClientForceJoin[client] = true;
-		int team = GetSmallestTeam();
-		ClientCommand(client, "jointeam 0 %i", team);
-		CreateTimer(2.0, Timer_DelayTeamUpdate, userId, TIMER_FLAG_NO_MAPCHANGE);
-		if (!IsPlayerAlive(client) && (g_iClientTeam[client] == TEAM_T || g_iClientTeam[client] == TEAM_CT) && (g_AllowSpawn || AreTeamsEmpty()))
-		{
-			CS_RespawnPlayer(client);
-		}
-	}
-	else
-	{
-		g_iClientForceJoin[client] = false;
-	}
-	GetScore(client);
+	++g_PlayerCountChange;
 }
 public Action OnPlayerRunCmd(int client, int &buttons)
 {
@@ -1061,6 +1149,7 @@ Action CommandList_JoinTeam(int client, const char[] command, int argc)
 	if (g_iClientForceJoin[client])
 	{
 		g_iClientForceJoin[client] = false;
+		RequestFrame(DelayTeamUpdate, GetClientUserId(client));
 		return Plugin_Continue;
 	}
 	if (cvar_BlockTeamSwitch.IntValue == 2)
@@ -1082,11 +1171,66 @@ Action CommandList_JoinTeam(int client, const char[] command, int argc)
 	{
 		return Plugin_Stop;
 	}
-	g_iClientTeam[client] = team;
+	RequestFrame(DelayTeamUpdate, GetClientUserId(client));
 	return Plugin_Continue;
 }
 
-/* Admin Menu Functions */
+/* Menu Functions */
+void Cookie_ForceSpawnPreference(int client, CookieMenuAction action, any info, char[] buffer, int maxlen)
+{
+	if (action == CookieMenuAction_DisplayOption)
+	{
+		Format(buffer, maxlen, "%t", "Auto-Join Preference");
+	}
+	else if (action == CookieMenuAction_SelectOption)
+	{
+		ShowForceJoinMenu(client);
+	}
+}
+void ShowForceJoinMenu(int client)
+{
+	Menu menu = new Menu(MenuHandler_ForceJoin);
+	char option1[100];
+	char option2[100];
+	if (g_iClientForceJoinPreference[client] == 0)
+	{
+		Format(option1, sizeof(option1), "%t", "Auto-Join T/CT [ENABLED]");
+		Format(option2, sizeof(option2), "%t", "Auto-Join Spectator");
+		menu.AddItem("0", option1);
+		menu.AddItem("1", option2);
+	}
+	else if (g_iClientForceJoinPreference[client] == 1)
+	{
+		Format(option1, sizeof(option1), "%t", "Auto-Join T/CT");
+		Format(option2, sizeof(option2), "%t", "Auto-Join Spectator [ENABLED]");
+		menu.AddItem("0", option1);
+		menu.AddItem("1", option2);
+	}
+	menu.Display(client, MENU_TIME_FOREVER);
+}
+int MenuHandler_ForceJoin(Menu menu, MenuAction action, int client, int option)
+{
+	if (action == MenuAction_End)
+	{
+		delete menu;
+	}
+	else if (action == MenuAction_Select)
+	{
+		char menuItem[32];
+		menu.GetItem(option, menuItem, sizeof(menuItem));
+		if (StringToInt(menuItem) == 0)
+		{
+			g_iClientForceJoinPreference[client] = 0;
+		}
+		else if (StringToInt(menuItem) == 1)
+		{
+			g_iClientForceJoinPreference[client] = 1;
+		}
+	}
+	char sCookieValue[12];
+	IntToString(g_iClientForceJoinPreference[client], sCookieValue, sizeof(sCookieValue));
+	SetClientCookie(client, g_hForceSpawn, sCookieValue);
+}
 void OnAdminMenuReady(Handle aTopMenu)
 {
 	TopMenu topmenu = TopMenu.FromHandle(aTopMenu);
